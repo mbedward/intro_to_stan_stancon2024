@@ -1,3 +1,5 @@
+**Note: this repository is forked from Richard McElreath's [original workshop materials](https://github.com/rmcelreath/intro_to_stan_stancon2024). I have added a markdown document with some notes and code for the examples presented in the workshop slides. If you find any mistakes or missing bits in the markdown doc please let me know.**
+
 # Introduction to Probabilistic Programming with Stan
 
 What: A 3 hour course to introduce the core concepts and methods of probabilistic programming, using the Stan language
