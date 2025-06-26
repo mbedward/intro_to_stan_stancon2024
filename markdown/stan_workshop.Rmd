@@ -1,0 +1,863 @@
+---
+title: "Intro to Stan, Richard McElreath"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(here)
+
+library(cmdstanr)
+library(posterior)
+
+library(ggplot2)
+theme_set( theme_bw() )
+
+MODEL_DIR <- here("stan_models")
+if (!dir.exists(MODEL_DIR)) dir.create(MODEL_DIR)
+
+```
+
+
+## Summary
+
+Workshop run by Richard McElreath at the StanCon 2024 conference. Materials are available on GitHub at https://github.com/rmelreath/intro_to_stan_stancon2024
+
+Note that I (Michael) have tweaked the code and text a bit for this markdown document.
+
+It is assumed that you will be running the code chunks in this document interactively.
+
+
+## Helper code
+
+A utility function for sampling from cmdstanr models. This was provided in Richard McElreath's workshop materials (`script.R`) but has been slightly tweaked here to store the Stan model in specified directory and with a file name based on the name of the variable passed to the `model_code` argument. 
+
+```{r}
+
+get_samples <- function(model_code, data=list(), 
+                        model_dir = MODEL_DIR, 
+                        model_basename = NULL,
+                        seed=123, chains=4) {
+  
+    if (is.null(model_basename)) {
+      model_basename <- deparse(substitute(model_code))
+      
+      # remove '_code' from the base name if present
+      model_basename <- sub(model_basename, pattern = "_code", replacement = "")
+    }
+  
+    f <- write_stan_file(model_code, 
+                         dir = model_dir, 
+                         basename = model_basename)
+    
+    model_x <- cmdstan_model(f)
+    samples_1 <- model_x$sample(
+        data = data,
+        seed = seed,
+        chains = chains,
+        parallel_chains = chains,
+        refresh = 0
+    )
+    pr <- as_draws_rvars( samples_1$draws() )
+    p <- list()
+    for ( i in 1:length(pr) )
+        p[[ names(pr)[i] ]] <- draws_of( pr[[i]] )
+    return(p)
+}
+
+```
+
+
+## Section 1: Variables, constraints, distributions and relationships
+
+### Example 1
+
+Page 26 of workshop PDF.
+
+You are told: "The duration is between 5 and 25 minutes"
+
+A Stan model that represents this statement...
+
+```{r}
+
+model_code_1 <- "
+parameters {
+  real<lower=5, upper=25> duration;
+}
+"
+
+```
+
+
+Even though this is a minimal model, we can compile it and derive posterior samples of the single parameter...
+
+```{r}
+
+# Write the model code to file
+f <- write_stan_file(model_code_1, dir = MODEL_DIR, basename = "model_1")
+
+# Compile the model (takes a minute)
+model_1 <- cmdstan_model(f)
+
+# Sample the model (this will be fast!)
+samples_1 <- model_1$sample(
+    data = list(),
+    seed = 123,
+    chains = 4,
+    parallel_chains = 4,
+    refresh = 0
+)
+
+```
+
+
+Inspect the samples.
+
+```{r}
+
+samples_1$summary()
+
+```
+
+
+```{r}
+
+post <- posterior::as_draws_df( samples_1$draws() )
+
+plot(post$duration, xlab="sample", ylab="duration")
+
+```
+
+```{r}
+
+plot(density(post$duration, adj=0.1), xlab="duration", main="")
+
+```
+
+So the model samples are simply draws from a uniform distribution, based on the lower and upper constraints that we specified in the model code.
+
+
+### Example 2
+
+Page 34 of workshop PDF.
+
+You are told: "The average duration is 10 minutes"
+
+A Stan model that represents this statement...
+
+```{r}
+
+model_code_2 <- "
+parameters {
+  real<lower=0> duration;
+}
+model {
+  duration ~ exponential(1.0 / 10.0);
+}
+"
+
+```
+
+
+This time we will just use the helper function (defined at the top of this document) to compile and sample from the model.
+
+```{r}
+
+post2 <- get_samples(model_code_2)
+
+```
+
+
+```{r}
+
+mu <- mean(post2$duration) |> round(2)
+q90 <- quantile(post2$duration, c(0.05, 0.95)) |> round(2)
+
+plot(density(post2$duration, from=0, adj = 0.1), 
+     main = sprintf("Mean duration: %g\n90%% range: %g - %g", mu, q90[1], q90[2]), 
+     xlab = "Duration")
+
+```
+
+
+### Example 3
+
+Page 36 of workshop PDF.
+
+You are given some data for observed waiting times and asked to estimate the average.
+
+A Stan model for this task...
+
+
+```{r}
+
+model_code_3 <- "
+data {
+  int N;  // number of observations
+  array[N] real<lower=0> y;  // observed values
+}
+parameters {
+  // Unknown average value of waiting times
+  real<lower=0> avg_duration;
+}
+model {
+  // Relate the observed values to the unknown (to be estimated)
+  // average duration
+  y ~ exponential(1.0 / avg_duration);
+}
+"
+
+```
+
+
+Simulate some waiting time data from an exponential distribution.
+
+```{r}
+
+N <- 10
+set.seed(123)
+
+true_avg <- 10.0
+y <- rexp(N, 1.0 / true_avg)
+
+print(y, digits = 2)
+
+```
+
+
+Model the average waiting time.
+
+```{r}
+
+post3 <- get_samples(
+    model_code_3,
+    data=list(N=N, y=y)
+)
+
+```
+
+
+```{r}
+
+mu <- round(mean(post3$avg_duration), digits = 2)
+q <- round(quantile(post3$avg_duration, c(0.05, 0.95)), digits = 2)
+
+plot(density(post3$avg_duration, from=0, adj = 0.1), 
+     main = sprintf("Average duration: mean estimate: %g\n90%% range: %g - %g", 
+                    mu, q[1], q[2]), 
+     xlab = "Duration")
+
+```
+
+
+### Example 4
+
+Page 41 of workshop PDF.
+
+You are given some data for waiting times observed at separate locations and asked to estimate the average for each location.
+
+A Stan model for this task...
+
+```{r}
+
+model_code_4 <- "
+data {
+  int N;  // total number of observations
+  int M;  // number of locations
+  array[N] real<lower=0> y;  // observed values
+  array[N] int x;  // location index (from 1) for each observation
+}
+parameters {
+  // Unknown average value of waiting time at each location
+  array[M] real<lower=0> avg_duration;
+}
+model {
+  // Relate the observed values to the unknown (to be estimated)
+  // average duration. 
+  // Note how we don't need an explicit loop here although we could do that 
+  // for clarity at the expense of slightly longer computation time.
+  // Also note that if we did 1.0/avg_duration[x] this would provoke an error
+  // from Stan which is very picky about vector lengths etc.
+  //
+  y ~ exponential(avg_duration[x]^(-1));
+}
+"
+
+```
+
+
+Simulate some waiting time data for two locations.
+
+```{r}
+
+N <- 20
+set.seed(123)
+true_avg <- c(10, 20)
+
+# location indices
+x <- sample(1:2, size=N, replace=TRUE)
+
+# waiting times
+y_sim <- rexp(N, 1.0/true_avg[x])
+
+cat("Location 1:", round(y_sim[x == 1], digits = 2), "\n")
+cat("Location 2:", round(y_sim[x == 2], digits = 2))
+
+
+```
+
+
+Model the average waiting times.
+
+```{r}
+
+post4 <- get_samples(
+  model_code_4,
+  data = list(N=N, M=2, x=x, y=y_sim)
+)
+
+```
+
+
+```{r}
+
+# The `avg_duration` element in the `post4` object will be a two column matrix
+# where each column has samples for a given location.
+
+dat_gg <- as.data.frame(post4$avg_duration)
+colnames(dat_gg) <- c("location1", "location2")
+
+dat_gg <- tidyr::pivot_longer(dat_gg, c(location1, location2))
+
+ggplot(dat_gg, aes(x = value, colour = name)) +
+  geom_density(linewidth = 1)
+
+```
+
+
+## Generative modelling with cats
+
+From page 46 onwards in the workshop PDF...
+
+The best way to write a probabilistic program is to stop and go write a different program!
+
+Generative modelling explicitly connects scientific/mechanistic models of nature to inference algorithms.
+
+Helps to clarify goals, make logic of an estimator transparent and testable.
+
+
+
+The scenario is an animal home with cats for adoption. The cats are divided into two classes: black and other colours. The interest is in whether there is a difference in the time to adoption for black cats versus other cats.
+
+If the (constant) probability of a cat being adopted on any given day is p, then the probability of waiting D days for adoption is:
+
+  Pr(D) = p(1-p)^(D-1)
+
+In other words, it is the probability of being adopted on day D times the probability of not being adopted on each of the previous D-1 days. This is the geometric distribution or, more specifically, the version that Wikipedia refers to as the 'shifted geometric distribution'. 
+
+The R function for the density of the geometric distribution is `dgeom()` which is defined as:
+
+  Pr(x) = p(1-p)^x
+  
+Note that this is the non-shifted version (in Wikipedia parlance). It gives the probability of observing x consecutive failures before a success.
+
+To relate our preferred form to the R form, we can set the argument `x` to D-1 when calling R function `dgeom()`. When generating new values with `rgeom()` we can simply add 1 to the returned values.
+
+
+### Data
+
+Richard McElreath's `rethinking` package includes a large cat adoption data set from the Austin Texas Animal Center, but we can just download the dataset directly from GitHub without installing the package.
+
+Note: `read.csv2` is used here because fields are delimited by semicolons in the data file rather than commas.
+
+```{r}
+
+urlfile <- 'https://raw.githubusercontent.com/rmcelreath/rethinking/master/data/AustinCats.csv'
+d <- read.csv2(urlfile)
+
+## Data list for the model (developed below)
+cat_data <- list(
+  N = nrow(d),
+  days = d$days_to_event,
+  adopted = ifelse( d$out_event=="Adoption" , 1 , 0 ),
+  colour = ifelse( d$color=="Black" , 1 , 2 )
+)
+
+rm(d)
+
+```
+
+
+Plot a sample of the data with a lollipop line for each cat.
+
+```{r fig.height=8}
+
+set.seed(123)
+n <- 100
+idx <- sample(1:cat_data$N, size=n)
+
+ymax <- max(cat_data$days[idx])
+
+plot(NULL, xlim=c(0,ymax), ylim=c(1,n), xlab="days observed", ylab="cat",
+     main = "Lines with points are adoptions")
+
+for ( i in 1:n ) { 
+    j <- idx[i]
+    cat_colour <- ifelse( cat_data$colour[j]==1 , "black" , "orange" )
+    lines( c(0,cat_data$days[j]), c(i,i), lwd=2, col=cat_colour )
+    if ( cat_data$adopted[j]==1 ) points( cat_data$days[j], i, pch=16, cex=1.5, col=cat_colour )
+}
+
+```
+
+
+How should we model these data? We can begin by considering how they were generated. This involves two parts: the data generating process (what actually happens to a cat); and the observation process (what we do and don't record, e.g. time censoring).
+
+We will start with the process of adoption and then add observation (censoring) afterwards.
+
+First, we will simulate some data assuming that each cat is observed until it is adopted, and specifying different probabilities of adoption (per day) for black versus other cats. Then we will use Stan to attempt to recover the probability values from the simulated observations.
+
+
+### Function to simulate cat adoptions
+
+```{r}
+
+# Function to simulate data with no censoring (i.e. each cat is always adopted in the end)
+# n is number of cats
+# p is a two element vector for probability of adoption if black (1) or other (2)
+sim_cats1 <- function(n=1e3, p=c(0.1, 0.2), seed = NULL) {
+  if (!is.null(seed)) set.seed(seed)
+  
+  colour <- sample(c(1,2),size=n,replace=TRUE)
+  days <- rgeom( n , p[colour] ) + 1
+  return(list(N=n, days=days, colour=colour, adopted=rep(1,n)))
+}
+
+```
+
+
+### Simulated cat adoption data
+
+```{r}
+
+# Bit higher probability of adoption for non-black cats
+prob_adoption <- c(0.1, 0.15)
+
+sim_dat <- sim_cats1(p=prob_adoption, seed = 42)
+
+```
+
+
+### Stan model code
+
+```{r}
+
+cat_code_1 <- "
+// The things we observe...
+data {
+  int N;  // number of cats
+  array[N] int adopted;  // indicator: 1 = adopted, 0 = not adopted
+  array[N] int<lower=0> days;  // days until event
+  array[N] int colour;  // 1 = black, 2 = other
+}
+// The things we don't observe but want to know...
+parameters {
+  vector<lower=0, upper=1>[2] p;  // probabilities of adoption for black vs other cats
+}
+// The model that relates these things...
+model {
+  // Sample probabilities from a beta prior distribution.
+  //
+  // Note: Richard McElreath's original code used a beta(1,10) prior but after
+  // having problems with some sampling chains failing I changed this to a 
+  // more gentle beta(1,5) prior. Not sure what the problem was.
+  //
+  target += beta_lpdf(p|1,5);
+  
+  // The above line could also be coded as: p ~ beta(1, 5);
+
+  // Model cat adoptions
+  for (i in 1:N) {
+    real P = p[colour[i]];
+    if (adopted[i] == 1) {
+      // The contribution to log-likelihood.
+      // Note: both `target +=` and `target ~` syntaxes can be used here to
+      // progressively add to the target
+      target += log(P * (1-P)^(days[i] - 1));
+      
+    } else {
+      // === Something else goes here later ===
+      // We don't need this bit yet because all cats in the simulated data
+      // are adopted eventually.
+    }
+  }
+}
+"
+
+```
+
+
+### Fit the model to the simulated data
+
+```{r}
+
+postx <- get_samples(cat_code_1, data=sim_dat)
+
+```
+
+
+Graph the posterior probability densities for black vs other cats.
+
+```{r}
+
+d1 <- density(postx$p[,1], from=0.05, to=0.2)
+d2 <- density(postx$p[,2], from=0.05, to=0.2)
+
+ylim <- c(0, max(c(d1$y, d2$y)))
+
+plot(d1, lwd=3, xlab="Probability of adoption", ylim = ylim, main = "")
+lines(d2, lwd=3, col = "orange")
+
+abline(v = prob_adoption[1], lty=2, lwd=2)
+abline(v = prob_adoption[2], lty=2, col="orange", lwd=2)
+
+title(main = "Posterior densities of adoption probability",
+      sub = "Dashed lines indicate true values")
+
+```
+
+
+We could also graph these results in terms of the expected time until adoption which is: 1/Pr(adoption). Note, this includes the day of adoption plus the preceding waiting days.
+
+```{r}
+
+d1 <- density(1 / postx$p[,1])
+d2 <- density(1 / postx$p[,2])
+
+xlim <- quantile(c(d1$x, d2$x), probs = c(0.01, 0.99))
+ylim <- c(0, max(c(d1$y, d2$y)))
+
+plot(d1, lwd=3, xlab="Expected days until adoption", xlim = xlim, ylim = ylim, main = "")
+lines(d2, lwd=3, col = "orange")
+
+abline(v = 1 / prob_adoption[1], lty=2, lwd=2)
+abline(v = 1 / prob_adoption[2], lty=2, col="orange", lwd=2)
+
+title(main = "Posterior densities of time to adoption",
+      sub = "Dashed lines indicate true values")
+
+```
+
+
+
+### Considering the censored observations
+
+In the real cat adoption data, many cats were still not adopted at the last observation. Is this a problem for our modelling approach? We can investigate this by simulating some censored data and then fitting the model above that ignores the censoring.
+
+
+```{r}
+
+# Function to simulate data with some observations right-censored 
+# (i.e. cat not adopted at last observation).
+# n is number of cats
+# p is a two element vector for probability of adoption if black (1) or other (2)
+# cens maximum number of days that any cat is observed
+#
+sim_cats2 <- function(n=1e3, p=c(0.1, 0.2), cens=20, seed = NULL) {
+  if (!is.null(seed)) set.seed(seed)
+  
+  colour <- sample(c(1,2),size=n,replace=TRUE)
+  days <- rgeom( n , p[colour] ) + 1
+  adopted <- as.integer(days <= cens)
+  
+  # Apply censoring time to values of days observed
+  days <- ifelse(days < cens, days, cens)
+  
+  return(list(N=n, days=days, colour=colour, adopted=adopted))
+}
+
+```
+
+
+### Simulated cat adoption data with censoring
+
+```{r}
+
+# Bit higher probability of adoption for non-black cats
+prob_adoption <- c(0.1, 0.15)
+
+cens <- 20
+sim_dat_cens <- sim_cats2(p=prob_adoption, cens=cens, seed = 42)
+
+cat(sum(sim_dat_cens$adopted == 0), "cats not adopted within", cens, "days")
+
+```
+
+Model the data with the previous model. It will implicitly ignore the censored observations because we haven't told it what to do in those cases (i.e. no code in the branch for a contribution to the log-likelihood).
+
+```{r}
+
+postx <- get_samples(cat_code_1, data = sim_dat_cens)
+
+```
+
+
+Graph the posterior probability densities for black vs other cats.
+
+```{r}
+
+d1 <- density(postx$p[,1], from=0.05, to=0.2)
+d2 <- density(postx$p[,2], from=0.05, to=0.2)
+
+ylim <- c(0, max(c(d1$y, d2$y)))
+
+plot(d1, lwd=3, xlab="Probability of adoption", ylim = ylim, main = "")
+lines(d2, lwd=3, col = "orange")
+
+abline(v = prob_adoption[1], lty=2, lwd=2)
+abline(v = prob_adoption[2], lty=2, col="orange", lwd=2)
+
+title(main = "Posterior densities of adoption probability",
+      sub = "Dashed lines indicate true values")
+
+```
+
+
+This is terrible! The model has badly over-estimated the probability of adoption because it simply ignored the failures (i.e. the censored observations).
+
+
+### Updated model code
+
+The censored observations should contribute to the posterior estimate of the adoption probabilities for black and other cats. Recall from earlier that the probability of observing a cat adopted on day D is:
+
+Pr(D) = p(1-p)^(D-1)
+
+Therefore, the probability of last observing a cat on day D that is not yet adopted is:
+
+Pr(D) = (1-p)^D
+
+Aside: this is one minus the cumulative distribution function of the geometric distribution, also known as the complementary CDF or survival function.
+
+
+```{r}
+
+cat_code_2 <- "
+// The things we observe...
+data {
+  int N;  // number of cats
+  array[N] int adopted;  // indicator: 1 = adopted, 0 = not adopted
+  array[N] int<lower=0> days;  // days until event
+  array[N] int colour;  // 1 = black, 2 = other
+}
+// The things we don't observe but want to know...
+parameters {
+  vector<lower=0, upper=1>[2] p;  // probabilities of adoption for black vs other cats
+}
+// The model that relates these things...
+model {
+  // Sample probabilities from a beta prior distribution.
+  //
+  // Note: Richard McElreath's original code used a beta(1,10) prior but after
+  // having problems with some sampling chains failing I changed this to a 
+  // more gentle beta(1,5) prior. Not sure what the problem was.
+  //
+  target += beta_lpdf(p|1,5);
+
+  // The above line could also be coded as: p ~ beta(1, 5);
+
+  // Model cat adoptions
+  for (i in 1:N) {
+    real P = p[colour[i]];
+    if (adopted[i] == 1) {
+      // The contribution to log-likelihood.
+      // Note: both `target +=` and `target ~` syntaxes can be used here to
+      // progressively add to the target
+      //
+      //target += log(P * (1-P)^(days[i] - 1));
+      target += log(P) + (days[i] - 1)*log(1-P);
+      
+    } else {
+      // Not adopted at the last observation (don't give up hope!)
+      // target += log((1-P)^days[i]);
+      target += (days[i])*log(1-P);
+    }
+  }
+}
+"
+
+```
+
+
+### Fit the updated model to the simulated censored data
+
+```{r}
+
+postx <- get_samples(cat_code_2, data = sim_dat_cens)
+
+```
+
+
+Graph the posterior probability densities from the updated model.
+
+```{r}
+
+d1 <- density(postx$p[,1], from=0.05, to=0.2)
+d2 <- density(postx$p[,2], from=0.05, to=0.2)
+
+ylim <- c(0, max(c(d1$y, d2$y)))
+
+plot(d1, lwd=3, xlab="Probability of adoption", ylim = ylim, main = "")
+lines(d2, lwd=3, col = "orange")
+
+abline(v = prob_adoption[1], lty=2, lwd=2)
+abline(v = prob_adoption[2], lty=2, col="orange", lwd=2)
+
+title(main = "Posterior densities of adoption probability",
+      sub = "Dashed lines indicate true values")
+
+```
+
+
+### The moral of the story so far
+
+Using the simple generative model to simulate censored data allowed us to determine that the original model would produce biased results, and also to confirm that the updated model was free from this bias.
+
+
+### Variable censoring point
+
+In the previous version of the generative model the censoring point was fixed at a given number of days. But in the real cat data the censored records, i.e. cats not adopted at the time of the last observation, have a wide range of time values. Would the model still give reliable inferences with data like this?
+
+Back to the generative drawing board... 
+
+
+### Simulated cat adoption data with variable censoring point
+
+The function below simulates both time to adoption and a maximum potential observation time for each cat. Where the time to adoption is greater than the observation time we will have a right-censored observation. 
+
+```{r}
+
+# Function to simulate data with some observations right-censored,
+# i.e. cat not adopted at last observation, and with a variable censoring point.
+#
+# n is number of cats;
+#
+# p is a two element vector for probability of adoption if black (1) or other (2);
+#
+# censoring_prob is the probability that we will finish observing a cat on
+# any given day;
+#
+sim_cats3 <- function(n=1e3, p=c(0.1, 0.2), censoring_prob = 0.1, seed = NULL) {
+  if (!is.null(seed)) set.seed(seed)
+  
+  colour <- sample(c(1,2),size=n,replace=TRUE)
+  days_for_adoption <- rgeom(n, p[colour]) + 1
+  
+  max_days_observed <- rgeom(n, censoring_prob) + 1
+  
+  adopted <- as.integer(days_for_adoption <= max_days_observed)
+  
+  # Time values for the data records
+  days <- ifelse(adopted, days_for_adoption, max_days_observed)
+  
+  return(list(N=n, days=days, colour=colour, adopted=adopted))
+}
+
+```
+
+
+### Fit the updated model to simulated variable censoring data
+
+```{r}
+
+prob_adoption <- c(0.1, 0.15)
+
+sim_dat_variable <- sim_cats3(n = 1000, p = prob_adoption, censoring_prob = 0.15, seed = 123)
+
+nadopted <- sum(sim_dat_variable$adopted == 1)
+ncens <- sum(sim_dat_variable$adopted == 0)
+
+cat("Simulated data has", nadopted, "adopted cats and", ncens, "censored records \n")
+
+cat("\nAdoption summary:\n\n")
+with(sim_dat_variable, table(adopted, colour))
+
+```
+
+```{r}
+
+postx <- get_samples(cat_code_2, data = sim_dat_variable)
+
+```
+
+
+Graph the posterior probability densities from the model.
+
+```{r}
+
+d1 <- density(postx$p[,1], from=0.05, to=0.2)
+d2 <- density(postx$p[,2], from=0.05, to=0.2)
+
+ylim <- c(0, max(c(d1$y, d2$y)))
+
+plot(d1, lwd=3, xlab="Probability of adoption", ylim = ylim, main = "")
+lines(d2, lwd=3, col = "orange")
+
+abline(v = prob_adoption[1], lty=2, lwd=2)
+abline(v = prob_adoption[2], lty=2, col="orange", lwd=2)
+
+title(main = "Posterior densities of adoption probability",
+      sub = "Dashed lines indicate true values")
+
+```
+
+
+
+### Model the real cat data
+
+Now let's use the model to compare the probability of adoption for black cats versus less-stylish cats using the data set from the Austin Texas Animal Center.
+
+```{r}
+
+post_austin <- get_samples(cat_code_2, cat_data)
+
+```
+
+Graph the posterior probability densities from the updated model.
+
+```{r}
+
+d1 <- density(post_austin$p[,1])
+d2 <- density(post_austin$p[,2])
+
+xlim <- c(min(d1$x, d2$x), max(d1$x, d2$x))
+ylim <- c(0, max(c(d1$y, d2$y)))
+
+
+plot(d1, lwd=3, xlab="Probability of adoption", xlim = xlim, ylim = ylim, main = "")
+lines(d2, lwd=3, col = "orange")
+
+title(main = "Posterior densities of adoption probability")
+
+```
+
+
+```{r}
+
+expected_days1 <- 1 / post_austin$p[,1]
+expected_days2 <- 1 / post_austin$p[,2]
+
+d1 <- density(expected_days1)
+d2 <- density(expected_days2)
+
+xlim <- c(min(d1$x, d2$x), max(d1$x, d2$x))
+ylim <- c(0, max(c(d1$y, d2$y)))
+
+
+plot(d1, lwd=3, xlab="Expected number of days", xlim = xlim, ylim = ylim, main = "")
+lines(d2, lwd=3, col = "orange")
+
+title(main = "Posterior densities of time to adoption")
+
+```
+
